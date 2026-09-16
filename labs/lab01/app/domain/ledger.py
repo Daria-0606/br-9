@@ -25,5 +25,5 @@ class LedgerEntry:
 
     def signed_amount(self):
         if self.entry_type == "DEBIT":
-            return -self.amount
-        return self.amount
+            return -self.amount.amount
+        return self.amount.amount
