@@ -1,0 +1,68 @@
+import pytest
+from decimal import Decimal
+from datetime import date, datetime, timezone, timedelta
+from app import api
+from app.support.errors import DomainError
+from app.support.types import Repository, CheckResult, Money, money
+
+
+def error(code, operation):
+    with pytest.raises(DomainError) as caught:
+        operation()
+    assert caught.value.code == code
+
+
+def invoke(service, method, *args, **kwargs):
+    return api.call(service, method, *args, **kwargs)
+
+def entry(key="E1",amount="10",kind="DEBIT",account="ACC-1",transaction="TX-1",code="EUR"):
+    return api.make(key,transaction,account,money(amount,code),kind)
+
+def test_signed_journal_and_order():
+    service=api.create()
+    first=entry()
+    invoke(service,"record",first)
+    second=entry("E2","3","CREDIT")
+    invoke(service,"record",second)
+    invoke(service,"record",entry("E3","90",account="ACC-2",transaction="TX-2"))
+    assert invoke(service,"signed_total","ACC-1","EUR")==Decimal("-7")
+    assert invoke(service,"entries_for_transaction","TX-1")== (first,second)
+
+def test_empty_and_independent_repository():
+    service=api.create()
+    invoke(service,"record",entry())
+    assert invoke(api.create(),"entries_for_transaction","TX-1")==()
+
+def test_positive_and_immutable_entry():
+    error("INVALID_AMOUNT",lambda:entry(amount="0"))
+    item=entry()
+    for field,value in [("amount",money("2")),("entry_type","CREDIT")]:
+        with pytest.raises((AttributeError,TypeError)):setattr(item,field,value)
+
+def test_duplicate_id_does_not_replace_record():
+    service=api.create()
+    first=entry()
+    invoke(service,"record",first)
+    error("DUPLICATE_ENTRY",lambda:invoke(service,"record",entry(amount="20")))
+    assert invoke(service,"entries_for_transaction","TX-1")== (first,)
+    invoke(service,"record",entry("E2"))
+    assert len(invoke(service,"entries_for_transaction","TX-1"))==2
+
+from app.domain.posting_rules import PostingRule,AllowedEntryTypeRule,MaximumEntryAmountRule
+
+def test_abc_is_abstract():
+    with pytest.raises(TypeError):PostingRule()
+
+def test_types_and_cap_boundaries():
+    assert AllowedEntryTypeRule({"DEBIT"}).check(entry()).allowed
+    assert AllowedEntryTypeRule(set()).check(entry()).code=="ENTRY_TYPE_DENIED"
+    assert AllowedEntryTypeRule({"DEBIT"}).check(entry(kind="CREDIT")).code=="ENTRY_TYPE_DENIED"
+    assert MaximumEntryAmountRule(money("1000")).check(entry(amount="1000")).allowed
+    assert MaximumEntryAmountRule(money("1000")).check(entry(amount="1000.01")).code=="ENTRY_AMOUNT_LIMIT"
+    error("CURRENCY_MISMATCH",lambda:MaximumEntryAmountRule(money("1","USD")).check(entry()))
+
+def test_policies_used_before_record(monkeypatch):
+    monkeypatch.setattr(AllowedEntryTypeRule,"check",lambda *args:CheckResult(False,"CONTROL"))
+    service=api.create()
+    error("CONTROL",lambda:service.record(entry()))
+    assert service.entries_for_transaction("TX-1")==()
